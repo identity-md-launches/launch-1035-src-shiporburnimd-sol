@@ -1,0 +1,10 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "ShipOrBurnIMD",
+      "constructorArgs": []
+    }
+  ],
+  "notes": "Deploy only the unchanged ShipOrBurnIMD from src/ShipOrBurnIMD.sol to Ethereum mainnet. Its nonpayable constructor takes no arguments, makes no external calls and requires no code at any other address. It has no owner, admin, upgrade or pause; the factory receives no privileges. No token, distributor, pool, ETH funding or initialization calls are part of this launch. The fixed IMD oracle attester is 0x5598Aa9146215Bc13eb26f2c692Ad1461Fd32982. The EIP-712 domain remains IdentityMD Oracle, version 2, with the deployed contract as verifyingContract. The accepted ABI, Attestation struct, events, errors, constants and typehash remain unchanged. Funders later create ERC-20 vaults. The first valid attestation establishes a baseline; subsequent counted attestations are at least 6,000 blocks apart. A rising count pays one tranche to the builder; a flat count pays missTo, the burn address or the funder for refund vaults. Settlement binds the question hash to the vault's stored prefix hash and rejects future windows or windows more than 600 blocks old. settle and expire are permissionless; after the deadline, expire sends the remaining balance to missTo. linkSchedule only emits an event."
+}
