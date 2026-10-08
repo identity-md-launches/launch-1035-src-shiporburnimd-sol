@@ -32,6 +32,22 @@ contract FeeToken is ERC20 {
     }
 }
 
+/// @dev Models an issuer blocking a recipient after a vault has been funded.
+contract BlocklistToken is MockToken {
+    mapping(address => bool) public blocked;
+
+    error BlockedRecipient();
+
+    function blockRecipient(address recipient) external {
+        blocked[recipient] = true;
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        if (blocked[to]) revert BlockedRecipient();
+        super._update(from, to, value);
+    }
+}
+
 contract ShipOrBurnTest is Test {
     uint256 constant SIGNER_PK = 0xA11CE;
     uint128 constant TRANCHE = 1e18;
@@ -108,8 +124,17 @@ contract ShipOrBurnTest is Test {
     }
 
     function _settle(uint256 id, uint64 toBlock, uint256 count) internal {
+        _advanceTo(toBlock);
         ShipOrBurn.Attestation memory a = _att(prefix, toBlock, count);
         sob.settle(id, a, _sign(a, SIGNER_PK), prefix);
+    }
+
+    /// Existing lifecycle tests must reach each window before settling it.
+    function _advanceTo(uint64 toBlock) internal {
+        if (toBlock > block.number) {
+            vm.warp(block.timestamp + (uint256(toBlock) - block.number) * 12);
+            vm.roll(toBlock);
+        }
     }
 
     // ------------------------------------------------------------ lifecycle
@@ -154,12 +179,14 @@ contract ShipOrBurnTest is Test {
         uint64 b = uint64(block.number);
         _settle(id, b + 10, 7);
 
+        _advanceTo(b + 6_010);
         ShipOrBurn.Attestation memory a = _att(prefix, b + 6_010, 8);
         bytes memory sig = _sign(a, SIGNER_PK);
         vm.expectEmit(address(sob));
         emit ShipOrBurn.Shipped(id, 1, 8, TRANCHE, 1, a.requestId);
         sob.settle(id, a, sig, prefix);
 
+        _advanceTo(b + 12_010);
         a = _att(prefix, b + 12_010, 8);
         sig = _sign(a, SIGNER_PK);
         vm.expectEmit(address(sob));
@@ -246,6 +273,7 @@ contract ShipOrBurnTest is Test {
     function test_rejectsReplayAndTooSoon() public {
         uint256 id = _create(false);
         uint64 b = uint64(block.number);
+        _advanceTo(b + 10);
         ShipOrBurn.Attestation memory base = _att(prefix, b + 10, 7);
         bytes memory baseSig = _sign(base, SIGNER_PK);
         sob.settle(id, base, baseSig, prefix);
@@ -253,6 +281,7 @@ contract ShipOrBurnTest is Test {
         vm.expectRevert(ShipOrBurn.TooSoon.selector);
         sob.settle(id, base, baseSig, prefix); // replay
 
+        _advanceTo(b + 5_999);
         ShipOrBurn.Attestation memory early = _att(prefix, b + 5_999, 8);
         bytes memory earlySig = _sign(early, SIGNER_PK);
         vm.expectRevert(ShipOrBurn.TooSoon.selector);
@@ -263,6 +292,7 @@ contract ShipOrBurnTest is Test {
         uint256 id = _create(false);
         uint64 b = uint64(block.number);
         _settle(id, b + 10, 7);
+        _advanceTo(b + 6_010);
         ShipOrBurn.Attestation memory a = _att(prefix, b + 6_010, 6);
         bytes memory sig = _sign(a, SIGNER_PK);
         vm.expectRevert(ShipOrBurn.CountWentDown.selector);
@@ -275,6 +305,173 @@ contract ShipOrBurnTest is Test {
         bytes memory sig = _sign(a, SIGNER_PK);
         vm.expectRevert(ShipOrBurn.TooEarly.selector);
         sob.settle(id, a, sig, prefix);
+    }
+
+    // ------------------------------------------------------------ audit: verdict freshness
+
+    /// Both windows contained a merge, but delayed requests read the same live count.
+    function test_staleCatchUpCannotBurnAShippedTranche() public {
+        _checkStaleCatchUp(false);
+    }
+
+    function test_staleCatchUpCannotRefundAShippedTranche() public {
+        _checkStaleCatchUp(true);
+    }
+
+    function _checkStaleCatchUp(bool refund) internal {
+        uint256 id = _create(refund);
+        uint64 start = uint64(block.number);
+        _advanceTo(start + 5);
+        _settle(id, start, 7);
+        uint256 funderBefore = imd.balanceOf(funder);
+
+        // PR #8 at start+100, PR #9 at start+7000. The keeper resumes at start+12000.
+        _advanceTo(start + 12_000);
+        ShipOrBurn.Attestation memory stale = _att(prefix, start + 6_000, 9);
+        bytes memory sig = _sign(stale, SIGNER_PK);
+        bytes32 beforeState = keccak256(abi.encode(sob.getVault(id)));
+        vm.expectRevert(ShipOrBurn.AttestationExpired.selector);
+        sob.settle(id, stale, sig, prefix);
+        assertEq(keccak256(abi.encode(sob.getVault(id))), beforeState);
+
+        // The fresh request still pays for shipping, without manufacturing a flat verdict.
+        _settle(id, start + 12_000, 9);
+        assertEq(imd.balanceOf(builder), TRANCHE);
+        assertEq(imd.balanceOf(sob.DEAD()), 0);
+        assertEq(imd.balanceOf(funder), funderBefore);
+        assertEq(sob.getVault(id).settled, 1);
+        assertEq(imd.balanceOf(address(sob)), 2 * TRANCHE);
+
+        // A missed historical window is not backfilled; the remaining funds still expire.
+        vm.warp(sob.getVault(id).deadline + 1);
+        sob.expire(id);
+        assertTrue(sob.getVault(id).closed);
+        assertEq(imd.balanceOf(address(sob)), 0);
+        assertEq(imd.balanceOf(builder), TRANCHE);
+        if (refund) assertEq(imd.balanceOf(funder), funderBefore + 2 * TRANCHE);
+        else assertEq(imd.balanceOf(sob.DEAD()), 2 * TRANCHE);
+    }
+
+    function test_rejectsFutureBaselineAndVerdict() public {
+        uint256 id = _create(false);
+        uint64 start = uint64(block.number);
+        ShipOrBurn.Attestation memory a = _att(prefix, start + 1, 7);
+        bytes memory sig = _sign(a, SIGNER_PK);
+        vm.expectRevert(ShipOrBurn.TooEarly.selector);
+        sob.settle(id, a, sig, prefix);
+        assertFalse(sob.getVault(id).baselined);
+
+        _settle(id, start, 7);
+        a = _att(prefix, start + 6_000, 8);
+        sig = _sign(a, SIGNER_PK);
+        vm.expectRevert(ShipOrBurn.TooEarly.selector);
+        sob.settle(id, a, sig, prefix);
+        assertEq(sob.getVault(id).settled, 0);
+        assertEq(imd.balanceOf(address(sob)), uint256(TRANCHE) * TRANCHES);
+
+        _advanceTo(start + 6_000);
+        sob.settle(id, a, sig, prefix);
+        assertEq(imd.balanceOf(builder), TRANCHE);
+    }
+
+    function test_rejectsStaleBaselineThenAcceptsFreshBaseline() public {
+        uint256 id = _create(false);
+        uint64 start = uint64(block.number);
+        _advanceTo(start + 601);
+        ShipOrBurn.Attestation memory a = _att(prefix, start, 7);
+        bytes memory sig = _sign(a, SIGNER_PK);
+        vm.expectRevert(ShipOrBurn.AttestationExpired.selector);
+        sob.settle(id, a, sig, prefix);
+        assertFalse(sob.getVault(id).baselined);
+
+        _settle(id, uint64(block.number), 9);
+        assertTrue(sob.getVault(id).baselined);
+        assertEq(sob.getVault(id).settled, 0);
+        assertEq(imd.balanceOf(address(sob)), uint256(TRANCHE) * TRANCHES);
+    }
+
+    function test_acceptsExactly600BlocksOfLag() public {
+        uint256 id = _create(false);
+        uint64 start = uint64(block.number);
+        _advanceTo(start + 600);
+        _settle(id, start, 7);
+        _advanceTo(start + 6_600);
+        _settle(id, start + 6_000, 8);
+        _advanceTo(start + 12_600);
+        _settle(id, start + 12_000, 8);
+        assertEq(imd.balanceOf(builder), TRANCHE);
+        assertEq(imd.balanceOf(sob.DEAD()), TRANCHE);
+        assertEq(sob.getVault(id).settled, 2);
+    }
+
+    function test_rejectsVerdictAt601BlocksOfLag() public {
+        uint256 id = _create(false);
+        uint64 start = uint64(block.number);
+        _settle(id, start, 7);
+        _advanceTo(start + 6_601);
+        ShipOrBurn.Attestation memory a = _att(prefix, start + 6_000, 8);
+        bytes memory sig = _sign(a, SIGNER_PK);
+        bytes32 beforeState = keccak256(abi.encode(sob.getVault(id)));
+        vm.expectRevert(ShipOrBurn.AttestationExpired.selector);
+        sob.settle(id, a, sig, prefix);
+        assertEq(keccak256(abi.encode(sob.getVault(id))), beforeState);
+        assertEq(imd.balanceOf(address(sob)), uint256(TRANCHE) * TRANCHES);
+    }
+
+    // ------------------------------------------------------------ reproduced, unchanged audit observations
+
+    function test_blockedFunderPreventsRefundAndExpiry() public {
+        BlocklistToken token = _useBlocklistToken();
+        uint256 id = _create(true);
+        uint64 start = uint64(block.number);
+        _settle(id, start, 7);
+        token.blockRecipient(funder);
+        _advanceTo(start + 6_000);
+        ShipOrBurn.Attestation memory a = _att(prefix, start + 6_000, 7);
+        bytes memory sig = _sign(a, SIGNER_PK);
+        vm.expectRevert(BlocklistToken.BlockedRecipient.selector);
+        sob.settle(id, a, sig, prefix);
+        assertEq(sob.getVault(id).settled, 0);
+        vm.warp(sob.getVault(id).deadline + 1);
+        vm.expectRevert(BlocklistToken.BlockedRecipient.selector);
+        sob.expire(id);
+        assertFalse(sob.getVault(id).closed);
+        assertEq(token.balanceOf(address(sob)), uint256(TRANCHE) * TRANCHES);
+    }
+
+    function test_blockedBuilderPreventsShippingButAllowsExpiry() public {
+        BlocklistToken token = _useBlocklistToken();
+        uint256 id = _create(false);
+        uint64 start = uint64(block.number);
+        _settle(id, start, 7);
+        token.blockRecipient(builder);
+        _advanceTo(start + 6_000);
+        ShipOrBurn.Attestation memory a = _att(prefix, start + 6_000, 8);
+        bytes memory sig = _sign(a, SIGNER_PK);
+        vm.expectRevert(BlocklistToken.BlockedRecipient.selector);
+        sob.settle(id, a, sig, prefix);
+        assertEq(sob.getVault(id).settled, 0);
+        vm.warp(sob.getVault(id).deadline + 1);
+        sob.expire(id);
+        assertTrue(sob.getVault(id).closed);
+        assertEq(token.balanceOf(sob.DEAD()), uint256(TRANCHE) * TRANCHES);
+    }
+
+    function _useBlocklistToken() internal returns (BlocklistToken token) {
+        token = new BlocklistToken();
+        imd = token;
+        token.mint(funder, uint256(TRANCHE) * TRANCHES);
+        vm.prank(funder);
+        token.approve(address(sob), uint256(TRANCHE) * TRANCHES);
+    }
+
+    function test_futureIssuedAtIsAcceptedIfSignerApproves() public {
+        uint256 id = _create(false);
+        ShipOrBurn.Attestation memory a = _att(prefix, uint64(block.number), 7);
+        a.issuedAt = type(uint64).max;
+        a.expiresAt = uint64(block.timestamp + 1 days);
+        sob.settle(id, a, _sign(a, SIGNER_PK), prefix);
+        assertTrue(sob.getVault(id).baselined);
     }
 
     // ------------------------------------------------------------ deadline

@@ -197,6 +197,11 @@ contract ShipOrBurn is EIP712, ReentrancyGuard {
 
         uint256 count = abi.decode(a.answer, (uint256));
 
+        // Live counters cannot backfill old windows. Allow 600 blocks (~2h) for delivery,
+        // including the baseline, and never count a window that has not ended yet.
+        if (a.toBlock > block.number) revert TooEarly();
+        if (block.number - a.toBlock > 600) revert AttestationExpired();
+
         // 6. ordering: the first attestation after creation is the baseline, then one verdict per spacing
         if (!v.baselined) {
             if (a.toBlock < v.startBlock) revert TooEarly();

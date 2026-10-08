@@ -26,9 +26,13 @@ Built with Foundry 1.8.3, the version IMD's verifier runs, and solc 0.8.26. Depe
 3. **A real panel.** panelSize ≥ 5, agreed ≥ 4, agreed ≥ quorum.
 4. **Fresh.** `block.timestamp <= expiresAt`.
 5. **Signed by IMD.** EIP-712 domain `IdentityMD Oracle` version `2`, this contract as verifyingContract.
-6. **In order.** The first attestation after creation is the baseline; each verdict's toBlock is ≥ 6,000 blocks after the last; the count never goes down.
+6. **Recent and in order.** Every attestation, including the baseline, must have `toBlock <= block.number` and be at most 600 blocks old when settled. The first attestation after creation is the baseline; each verdict's toBlock is ≥ 6,000 blocks after the last; the count never goes down. Future windows revert with `TooEarly`; windows more than 600 blocks old revert with `AttestationExpired`.
 
 `MIN_SPACING` assumes 12-second blocks, so this version is for Ethereum mainnet and Sepolia only.
+
+Keepers must request a recent window and settle within 600 blocks of its end (about two hours at 12 seconds per block). After an outage, request one fresh verdict; do not backfill missed windows with the current live count. Remaining tranches still go to `missTo` after the deadline.
+
+Tokens that block transfers to the builder, funder or burn recipient can prevent payouts. In particular, blocking a refund recipient can leave both settlement and expiry reverting with funds locked. There is no recipient replacement or recovery path; token transfer restrictions are a funding risk.
 
 ## Golden vectors
 
