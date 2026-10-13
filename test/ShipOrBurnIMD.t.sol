@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 import {ShipOrBurnIMD} from "../src/ShipOrBurnIMD.sol";
 
 /// @dev Models the launch factory's zero-value CREATE2, with no initialization call.
@@ -12,6 +13,40 @@ contract ShipOrBurnFactoryProbe {
 }
 
 contract ShipOrBurnIMDTest is Test {
+    function test_constructorCreatesOnlyTheApplicationAndMakesNoExternalCalls() public {
+        vm.chainId(1);
+        ShipOrBurnFactoryProbe factory = new ShipOrBurnFactoryProbe();
+        vm.startStateDiffRecording();
+        ShipOrBurnIMD sob = factory.deploy(keccak256("constructor call trace"));
+        VmSafe.AccountAccess[] memory accesses = vm.stopAndReturnStateDiff();
+        uint256 creations;
+        uint256 calls;
+        for (uint256 i; i < accesses.length; ++i) {
+            VmSafe.AccountAccess memory access = accesses[i];
+            if (access.kind == VmSafe.AccountAccessKind.Create) {
+                ++creations;
+                assertEq(access.account, address(sob));
+                assertEq(access.accessor, address(factory));
+                assertEq(access.value, 0);
+            } else if (access.kind == VmSafe.AccountAccessKind.Call) {
+                ++calls;
+                assertEq(access.account, address(factory), "constructor called an external dependency");
+                assertEq(access.accessor, address(this));
+            } else {
+                assertTrue(
+                    access.kind != VmSafe.AccountAccessKind.StaticCall
+                        && access.kind != VmSafe.AccountAccessKind.DelegateCall
+                        && access.kind != VmSafe.AccountAccessKind.CallCode
+                        && access.kind != VmSafe.AccountAccessKind.SelfDestruct,
+                    "unexpected constructor interaction"
+                );
+            }
+        }
+        assertEq(creations, 1, "constructor created another contract");
+        assertEq(calls, 1, "only the test's factory call is expected");
+        assertEq(sob.vaultCount(), 0);
+    }
+
     function test_usesImdSigner() public {
         ShipOrBurnIMD sob = new ShipOrBurnIMD();
         assertEq(sob.attester(), 0x5598Aa9146215Bc13eb26f2c692Ad1461Fd32982);

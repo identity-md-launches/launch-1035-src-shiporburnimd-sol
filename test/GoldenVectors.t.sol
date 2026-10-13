@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ShipOrBurn} from "../src/ShipOrBurn.sol";
+import {ShipOrBurnIMD} from "../src/ShipOrBurnIMD.sol";
 
 /// @dev IMD's version-1 attestation (signed before 2026-09-30): no panelSize, quorum or agreed.
 ///      Used only to prove our field encoding against a real signature from IMD's signer.
@@ -52,7 +53,7 @@ contract GoldenVectorsTest is Test {
 
     function setUp() public {
         vm.chainId(1);
-        sob = new ShipOrBurn(IMD_SIGNER);
+        sob = new ShipOrBurnIMD();
     }
 
     /// questionHash = keccak256 of the request's canonical JSON, window last.
@@ -91,7 +92,7 @@ contract GoldenVectorsTest is Test {
     /// Our version-2 digest equals an independent EIP-712 implementation (Python eth_account).
     function test_v2DigestMatchesReference() public {
         address at = address(0x5B0B);
-        deployCodeTo("ShipOrBurn.sol:ShipOrBurn", abi.encode(IMD_SIGNER), at);
+        deployCodeTo("ShipOrBurnIMD.sol:ShipOrBurnIMD", at);
         ShipOrBurn.Attestation memory a = ShipOrBurn.Attestation({
             requestId: 0x1111111111111111111111111111111100000000000000000000000000000000,
             chainId: 1,
@@ -118,7 +119,7 @@ contract GoldenVectorsTest is Test {
     /// (oracle request 16051ac5-3319-479c-ac22-9ca9a11cd727, a uint256 panel answer).
     function test_realImdV2SignatureRecovers() public {
         address consumer = 0x37Bfb8AC7C960E558657871D41Ca70E07e7DbfFf;
-        deployCodeTo("ShipOrBurn.sol:ShipOrBurn", abi.encode(IMD_SIGNER), consumer);
+        deployCodeTo("ShipOrBurnIMD.sol:ShipOrBurnIMD", consumer);
         ShipOrBurn.Attestation memory a = ShipOrBurn.Attestation({
             requestId: 0x16051ac53319479cac229ca9a11cd72700000000000000000000000000000000,
             chainId: 1,
@@ -139,5 +140,38 @@ contract GoldenVectorsTest is Test {
         bytes memory sig =
             hex"94d3d979ccf52901db4f6f21f07cd8e123f46f69a8aac9e79a88dcc40475c67317174ffbce45766f075a5865ff9837b33f88f0f6da770f498ca703ae0927bfb11c";
         assertEq(ECDSA.recover(ShipOrBurn(consumer).attestationDigest(a), sig), IMD_SIGNER);
+    }
+
+    /// The supplied protocol vector also pins dynamic-answer hashing and a domain
+    /// chain different from a.chainId. It is a digest vector, not a valid vault verdict.
+    function test_protocolConformanceVectorOnProductionContract() public {
+        vm.chainId(11155111);
+        address consumer = 0x0000000000000000000000000000000000002748;
+        deployCodeTo("ShipOrBurnIMD.sol:ShipOrBurnIMD", consumer);
+        bytes32[] memory ids = new bytes32[](1);
+        ids[0] = bytes32(uint256(1));
+        ShipOrBurn.Attestation memory a = ShipOrBurn.Attestation({
+            requestId: 0x0000000000004000800000000000000100000000000000000000000000000000,
+            chainId: 1,
+            questionHash: 0x2117f4362ebfa37aa8a8c0fed548604fe09ac46faf8ae7559cd64780f26a46fb,
+            answerType: 5,
+            answer: abi.encode(ids),
+            figure: 12345,
+            fromBlock: 100,
+            toBlock: 200,
+            blockHash: bytes32(uint256(7)),
+            panelJobId: 0x0000000000004000800000000000000200000000000000000000000000000000,
+            panelSize: 5,
+            quorum: 4,
+            agreed: 5,
+            issuedAt: 1800000000,
+            expiresAt: 1800003600
+        });
+        bytes32 digest = ShipOrBurnIMD(consumer).attestationDigest(a);
+        assertEq(digest, 0x95fefa8b7c529852f4e2b6aec888930eb2bf5078e6443a85808e36df19e1325c);
+        bytes memory signature =
+            hex"a26b14918607eb565af126beb54d3c5d19e923c41506def500b3521a4f9aa6d603ab44fd22f15dd2191732961a7131e4641244add8b0f09f20e6ae64381be8481b";
+        assertEq(ECDSA.recover(digest, signature), 0x70997970C51812dc3A010C7d01b50e0d17dc79C8);
+        assertEq(ShipOrBurnIMD(consumer).attester(), IMD_SIGNER);
     }
 }
